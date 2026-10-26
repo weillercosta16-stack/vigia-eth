@@ -1,0 +1,39 @@
+name: vigia-eth
+on:
+  schedule:
+    - cron: "*/10 * * * *"      # a cada 10 min (o GitHub às vezes atrasa alguns minutos)
+  workflow_dispatch: {}          # botão "Run workflow" para testar na hora
+permissions:
+  contents: write                # só para o "mantém vivo" mensal
+concurrency:
+  group: vigia
+  cancel-in-progress: false
+jobs:
+  vigia:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: Recupera o estado da rodada anterior
+        uses: actions/cache/restore@v4
+        with:
+          path: estado
+          key: estado-${{ github.run_id }}
+          restore-keys: estado-
+      - name: Roda o vigia
+        env:
+          NTFY_TOPICO: ${{ secrets.NTFY_TOPICO }}
+        run: python3 vigia_acao.py && tail -3 cripto.log || (cat cripto.log; exit 1)
+      - name: Guarda o estado
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: estado
+          key: estado-${{ github.run_id }}
+      - name: Mantém o agendamento vivo (o GitHub pausa após 60 dias sem mudanças)
+        if: github.event_name == 'schedule'
+        run: |
+          if [ "$(date -u +%d%H%M | cut -c1-4)" = "0100" ]; then
+            git config user.name "vigia"; git config user.email "vigia@users.noreply.github.com"
+            git commit --allow-empty -m "mantém o vigia ativo" && git push || true
+          fi
