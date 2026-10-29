@@ -4,7 +4,8 @@ Regras (definidas por ele):
   * O gráfico de 1 DIA define a tendência: preço acima ou abaixo da EMA 200, e topos/fundos subindo ou descendo.
   * O gráfico de 1 HORA dá o ponto de entrada pelo RSI 14 (candle fechado):
       - tendência de alta (acima da EMA 200): RSI abaixo de 40 = entrada; acima de 66 = aguardar
-      - tendência de baixa (abaixo da EMA 200): RSI abaixo de 30 = entrada
+      - tendência de baixa (abaixo da EMA 200): RSI entre 20 e 35 = entrada
+  * Só avisa a entrada se algum alvo der pelo menos 3 por 1: lucro líquido >= 3x a perda do stop (com a taxa).
   * Reforços (entrada forte): Bollinger de baixo, suporte por perto (fundos anteriores, EMA 21/50), tendência confirmada.
   * Cuidados: resistência logo acima, preço furando a EMA 50 para baixo.
 
@@ -13,6 +14,7 @@ Uso: pythonw cripto.py            (o Jarvis abre sozinho: "Jarvis, modo cripto")
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
@@ -46,6 +48,7 @@ PADRAO = {
     "valor_trade": 10000,          # US$ por operação (muda na tela)
     "taxa_pct": 1.5,               # taxa total (entrada + saída) em % do valor: 10 mil → 150
     "margem_alvo": 0.3,            # % — sai um pouco antes de tocar na resistência
+    "rr_minimo": 3,                # só avisa entrada se o lucro líquido for pelo menos 3x a perda do stop
     "voz": True,                   # o Jarvis fala o sinal
     "margem_ema200": 0.3,          # % — colado na EMA 200 = indefinido
     "perto_ema": 0.5,              # % — "testando a EMA"
@@ -74,10 +77,36 @@ def ler_ajustes() -> dict:
     return a
 
 
+_TRAVA_ARQ = threading.RLock()          # salvar_ajustes e gravar_desenhos mexem no mesmo arquivo
+_DESENHOS_VISTOS = {"v": None}          # último "desenhos" lido do arquivo (reserva se ele estiver sendo gravado)
+
+
 def salvar_ajustes(a: dict):
+    with _TRAVA_ARQ:
+        _salvar_ajustes(a)
+
+
+def _salvar_ajustes(a: dict):
     try:
+        dados = {k: v for k, v in a.items() if k != "desenhos"}
+        # os desenhos do gráfico ficam como estão no arquivo (os agentes escrevem direto lá)
+        for tentativa in range(3):
+            try:
+                no_disco = json.loads(AJUSTES.read_text(encoding="utf-8"))
+                if isinstance(no_disco, dict) and isinstance(no_disco.get("desenhos"), list):
+                    _DESENHOS_VISTOS["v"] = no_disco["desenhos"]
+                    dados["desenhos"] = no_disco["desenhos"]
+                break
+            except FileNotFoundError:
+                break
+            except Exception:          # arquivo sendo gravado por outro: tenta de novo e, no fim, usa o último visto
+                if tentativa == 2:
+                    if _DESENHOS_VISTOS["v"] is not None:
+                        dados["desenhos"] = _DESENHOS_VISTOS["v"]
+                else:
+                    time.sleep(0.15)
         tmp = AJUSTES.with_suffix(".tmp")
-        tmp.write_text(json.dumps(a, ensure_ascii=False, indent=2), encoding="utf-8")
+        tmp.write_text(json.dumps(dados, ensure_ascii=False, indent=2), encoding="utf-8")
         os.replace(tmp, AJUSTES)
     except Exception as e:
         log.warning("salvar ajustes: %s", e)
@@ -356,19 +385,24 @@ def plano(a: dict, aj: dict) -> dict:
     """Alvos de saída antes das resistências (topos anteriores), com lucro líquido da taxa, e o stop no suporte."""
     preco, valor, taxa_pct, m = a["preco"], float(aj["valor_trade"]), float(aj["taxa_pct"]), float(aj["margem_alvo"])
     taxa = valor * taxa_pct / 100
-    alvos = []
-    for z in a["resistencias"]:
-        alvo = z["preco"] * (1 - m / 100)
-        bruto = valor * (alvo - preco) / preco
-        alvos.append({"preco": alvo, "resistencia": z["preco"], "origem": z["origem"], "liquido": bruto - taxa,
-                      "pct": (alvo - preco) / preco * 100})
     stop = None
     if a["suportes"]:
         z = a["suportes"][0]
         p = z["preco"] * (1 - m / 100)
         stop = {"preco": p, "suporte": z["preco"], "perda": valor * (p - preco) / preco - taxa, "pct": (p - preco) / preco * 100}
+    risco = abs(stop["perda"]) if stop else None
+    alvos = []
+    for z in a["resistencias"]:
+        alvo = z["preco"] * (1 - m / 100)
+        liquido = valor * (alvo - preco) / preco - taxa
+        alvos.append({"preco": alvo, "resistencia": z["preco"], "origem": z["origem"], "liquido": liquido,
+                      "pct": (alvo - preco) / preco * 100, "rr": liquido / risco if risco else None})
+    bons = [x for x in alvos if x["liquido"] > 0][:3]
+    # regra do Weiller: só entra se o lucro líquido for pelo menos rr_minimo vezes a perda do stop (3 por 1)
+    rr_min = float(aj.get("rr_minimo", 3))
+    vale = [x for x in alvos if x["rr"] is not None and x["rr"] >= rr_min]
     return {"valor": valor, "taxa": taxa, "eth": valor / preco, "empate": preco * (1 + taxa_pct / 100),
-            "alvos": alvos, "bons": [x for x in alvos if x["liquido"] > 0][:3], "stop": stop}
+            "alvos": alvos, "bons": bons, "stop": stop, "rr_min": rr_min, "melhor": vale[0] if vale else None}
 
 
 def numero_falado(v: float) -> str:
@@ -389,8 +423,9 @@ def texto_aviso(a: dict, aj: dict | None = None) -> tuple[str, str]:
     if a["reforcos"]:
         partes.append("A favor: " + "; ".join(a["reforcos"]) + ".")
     if pl["bons"]:
-        b = pl["bons"][0]
-        partes.append(f"Alvo: sair em {b['preco']:,.2f} (antes da resistência {b['resistencia']:,.2f}) → lucro ~${b['liquido']:,.0f} com ${pl['valor']:,.0f}.")
+        b = pl["melhor"] or pl["bons"][0]
+        rr = f" · risco/retorno {b['rr']:.1f} por 1" if b["rr"] is not None else ""
+        partes.append(f"Alvo: sair em {b['preco']:,.2f} (antes da resistência {b['resistencia']:,.2f}) → lucro ~${b['liquido']:,.0f} com ${pl['valor']:,.0f}{rr}.")
     else:
         partes.append(f"Sem resistência acima que pague a taxa (precisa passar de {pl['empate']:,.2f}).")
     if pl["stop"]:
@@ -412,14 +447,117 @@ def texto_falado(a: dict, aj: dict) -> str:
     frase = (f"{abre} no {nome}. RSI do gráfico de uma hora confirmado em {h['rsi_fechado']:.0f}, "
              f"diário em {tend}" + (f" com RSI em {d['rsi']:.0f}" if d.get("rsi") is not None else "") + ". ")
     if pl["bons"]:
-        b = pl["bons"][0]
+        b = pl["melhor"] or pl["bons"][0]
         frase += (f"Se entrar agora, dá pra sair antes da resistência do topo anterior em {numero_falado(b['resistencia'])}, "
-                  f"com lucro de uns {numero_falado(b['liquido'])} dólares, já tirando a taxa.")
+                  f"com lucro de uns {numero_falado(b['liquido'])} dólares, já tirando a taxa")
+        frase += f", {b['rr']:.0f} por 1 sobre o stop." if b["rr"] is not None else "."
     else:
         frase += f"Cuidado: não tem topo anterior perto que pague a taxa; precisa passar de {numero_falado(pl['empate'])}."
     if pl["stop"]:
         frase += f" Se perder o suporte de {numero_falado(pl['stop']['suporte'])}, a perda fica em uns {numero_falado(abs(pl['stop']['perda']))} dólares."
     return frase
+
+
+# ------------------------------------------------------------------ tempos gráficos extras (só para VER na tela)
+# Os sinais continuam usando só 1h e 1d (analisar). 4h, 1 semana e 1 mês são baixados quando a tela pede,
+# com cache: não pesam no ciclo de 10 s.
+TF_EXTRA = {"4h": {"lado": 3, "cache": 60}, "1w": {"lado": 2, "cache": 1800}, "1M": {"lado": 2, "cache": 3600}}
+
+
+def niveis_grafico(cs: list[dict], lado: int, preco: float, juntar_pct: float, n: int = 3) -> dict:
+    """Suportes e resistências do próprio tempo gráfico (topos/fundos já fechados), perto do preço de agora."""
+    tp, fd = pivos(cs[:-1], lado)
+    zs = zonas([(p, "fundo") for _, p in fd[-20:]] + [(p, "topo") for _, p in tp[-20:]], juntar_pct)
+    sup = sorted([z for z in zs if z["preco"] < preco], key=lambda z: -z["preco"])[:n]
+    res = sorted([z for z in zs if z["preco"] > preco], key=lambda z: z["preco"])[:n]
+    for z in sup + res:
+        z["dist"] = pct(z["preco"], preco)
+        z["preco"] = r2(z["preco"])
+    return {"suportes": sup, "resistencias": res}
+
+
+# ------------------------------------------------------------------ desenhos no gráfico (chave "desenhos" do cripto.json)
+# Formato (os agentes podem escrever direto no arquivo; a tela recarrega sozinha em ~1 s):
+#   "desenhos": [
+#     {"id": "a1b2c3", "tipo": "tendencia", "pontos": [{"t": 1793232000, "p": 2290.5}, {"t": 1793318400, "p": 2350}],
+#      "cor": "#0e7490", "texto": "LTA", "autor": "agente", "estender": false}
+#   ]
+#   t = horário em segundos UTC (também aceita milissegundos ou "2026-10-28 14:00" em UTC); p = preço em USDT.
+#   tipos e nº de pontos: horizontal 1 · tendencia 2 · raio 2 (tendência estendida para a direita) · canal 3
+#   (2 da linha base + 1 que dá a largura) · funil 4 (2 da linha de cima + 2 da de baixo) · seta_cima 1 · seta_baixo 1 · texto 1.
+#   autor: "usuario" ou "agente" (o do agente aparece tracejado). cor, texto e estender são opcionais.
+TIPOS_DESENHO = {"horizontal": 1, "tendencia": 2, "raio": 2, "canal": 3, "funil": 4, "seta_cima": 1, "seta_baixo": 1, "texto": 1}
+
+
+def _tempo_desenho(t) -> int:
+    if isinstance(t, str) and not re.fullmatch(r"-?\d+(\.\d+)?", t.strip()):
+        from datetime import datetime, timezone
+        dt = datetime.fromisoformat(t.strip().replace("Z", "").replace("T", " "))
+        return int(dt.replace(tzinfo=timezone.utc).timestamp()) if dt.tzinfo is None else int(dt.timestamp())
+    t = float(t)
+    return int(t // 1000 if t > 1e11 else t)
+
+
+def normalizar_desenho(d, autor_padrao: str = "agente") -> dict | None:
+    """Confere e arruma um desenho. Devolve None se não der para usar."""
+    try:
+        tipo = str(d.get("tipo", "")).strip().lower()
+        if tipo not in TIPOS_DESENHO:
+            return None
+        pontos = []
+        for q in d.get("pontos") or []:
+            pontos.append({"t": _tempo_desenho(q.get("t", 0) or 0), "p": round(float(q["p"]), 2)})
+        if len(pontos) < TIPOS_DESENHO[tipo]:
+            return None
+        # sem id (agente escreveu à mão): id fixo tirado do conteúdo, para não mudar a cada leitura
+        id_ = d.get("id") or hashlib.sha1(json.dumps([tipo, pontos, d.get("texto")], sort_keys=True).encode()).hexdigest()[:8]
+        out = {"id": str(id_)[:40], "tipo": tipo,
+               "pontos": pontos[:TIPOS_DESENHO[tipo]], "autor": "usuario" if d.get("autor") == "usuario" else
+               ("agente" if d.get("autor") else autor_padrao)}
+        cor = str(d.get("cor") or "")
+        if re.fullmatch(r"#[0-9a-fA-F]{3,8}", cor):
+            out["cor"] = cor
+        if d.get("texto"):
+            out["texto"] = str(d["texto"])[:80]
+        if d.get("estender"):
+            out["estender"] = True
+        return out
+    except Exception:
+        return None
+
+
+def ler_desenhos() -> list[dict] | None:
+    """Desenhos do cripto.json já conferidos. None se o arquivo estiver ilegível agora (sendo gravado)."""
+    try:
+        bruto = json.loads(AJUSTES.read_text(encoding="utf-8")).get("desenhos") or []
+    except FileNotFoundError:
+        return []
+    except Exception:
+        return None
+    out, ids = [], set()
+    for d in bruto if isinstance(bruto, list) else []:
+        n = normalizar_desenho(d) if isinstance(d, dict) else None
+        if n:
+            base, k = n["id"], 2
+            while n["id"] in ids:          # id repetido: sufixo fixo (não muda entre leituras)
+                n["id"] = f"{base}-{k}"; k += 1
+            ids.add(n["id"]); out.append(n)
+    return out
+
+
+def gravar_desenhos(lista: list[dict]):
+    with _TRAVA_ARQ:
+        try:
+            dados = json.loads(AJUSTES.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            dados = {}           # arquivo ilegível (ex.: alguém gravando agora): erro sobe e nada é apagado
+        if not isinstance(dados, dict):
+            raise ValueError("cripto.json não é um objeto")
+        dados["desenhos"] = lista
+        _DESENHOS_VISTOS["v"] = lista
+        tmp = AJUSTES.with_suffix(".tmp")
+        tmp.write_text(json.dumps(dados, ensure_ascii=False, indent=2), encoding="utf-8")
+        os.replace(tmp, AJUSTES)
 
 
 # ------------------------------------------------------------------ avisos
@@ -542,6 +680,12 @@ class Cripto:
         self.enviado: dict = {}      # qual pedaço do gráfico a tela já tem
         self.preco_ant = None
         self.armado_saida = est.get("armado_saida", True)
+        self.ignorado = None         # (candle, nivel) de sinal que não fechou 3 por 1 (já registrado no log)
+        self.cache_tf: dict = {}     # tempos gráficos extras (4h/1w/1M): {tf: (quando, candles)}
+        self._trava_tf = threading.Lock()
+        self._trava_des = threading.Lock()
+        self._des_mtime = None       # última versão do cripto.json vista pelos desenhos
+        self._des_ass = None         # desenhos que a tela já tem (para não mandar de novo)
 
     def js(self, fn: str, dado):
         if self.janela is not None and self.pronta.is_set():
@@ -639,6 +783,99 @@ class Cripto:
         salvar_ajustes(self.aj); self.publicar_estado()
         return self.aj["linhas"]
 
+    def mover_linha(self, id_, preco):
+        """Arrastou a linha de aviso no gráfico: muda o preço e rearma o aviso."""
+        try:
+            preco = round(float(preco), 2)
+        except Exception:
+            return self.aj.get("linhas", [])
+        for l in self.aj.get("linhas", []):
+            if l["id"] == id_ and preco > 0:
+                l["preco"] = preco; l["tocou"] = False
+        salvar_ajustes(self.aj); self.publicar_estado()
+        return self.aj.get("linhas", [])
+
+    # -- tempos gráficos extras (4h, 1 semana, 1 mês): só para ver; baixa quando a tela pede, com cache
+    def grafico_tf(self, tf):
+        cfg = TF_EXTRA.get(tf)
+        if not cfg:
+            return {"erro": f"tempo gráfico desconhecido: {tf}"}
+        with self._trava_tf:
+            quando, cs = self.cache_tf.get(tf, (0.0, None))
+            if cs is None or time.time() - quando > cfg["cache"]:
+                try:
+                    cs = candles(self.aj["par"], tf, 500)
+                    self.cache_tf[tf] = (time.time(), cs)
+                except Exception as e:
+                    log.info("gráfico %s: %s", tf, e)
+                    if cs is None:
+                        return {"erro": "Sem dados da Binance agora."}
+        cs = list(cs)
+        preco = (self.ultima or {}).get("preco")
+        if preco and cs and time.time() * 1000 <= cs[-1]["fim"]:
+            ult = dict(cs[-1])                    # o preço de agora atualiza a vela aberta
+            ult["c"] = preco; ult["h"] = max(ult["h"], preco); ult["l"] = min(ult["l"], preco)
+            cs[-1] = ult
+        sr = serie_grafico(cs, cfg["lado"])
+        sr["niveis"] = niveis_grafico(cs, cfg["lado"], preco or cs[-1]["c"], float(self.aj.get("zona_juntar", 0.5)))
+        sr["tf"], sr["cache"] = tf, cfg["cache"]
+        return sr
+
+    # -- desenhos do gráfico (ficam na chave "desenhos" do cripto.json; os agentes também escrevem lá)
+    def desenhos(self):
+        lista = ler_desenhos()
+        if lista is None:
+            return {"erro": "cripto.json ocupado, tente de novo"}
+        self._des_ass = json.dumps(lista, sort_keys=True)
+        return lista
+
+    def _mudar_desenhos(self, mudar):
+        with self._trava_des:
+            lista = ler_desenhos()
+            if lista is None:
+                return {"erro": "cripto.json ocupado, tente de novo"}
+            lista = mudar(lista)
+            try:
+                gravar_desenhos(lista)
+            except Exception as e:
+                log.warning("gravar desenhos: %s", e)
+                return {"erro": "não consegui salvar o desenho"}
+            self._des_ass = json.dumps(lista, sort_keys=True)
+            return lista
+
+    def salvar_desenho(self, d):
+        n = normalizar_desenho(d if isinstance(d, dict) else {}, autor_padrao="usuario")
+        if not n:
+            return {"erro": "desenho inválido"}
+        def trocar(ls):           # mesmo id = atualiza no lugar; id novo = acrescenta no fim
+            if any(x["id"] == n["id"] for x in ls):
+                return [n if x["id"] == n["id"] else x for x in ls]
+            return ls + [n]
+        return self._mudar_desenhos(trocar)
+
+    def apagar_desenho(self, id_):
+        return self._mudar_desenhos(lambda ls: [x for x in ls if x["id"] != id_])
+
+    def limpar_desenhos(self, autor=None):
+        return self._mudar_desenhos(lambda ls: [x for x in ls if autor and x.get("autor") != autor])
+
+    def checar_desenhos(self):
+        """Se o cripto.json mudou (ex.: um agente marcou algo), manda os desenhos novos para a tela."""
+        try:
+            m = AJUSTES.stat().st_mtime_ns
+        except Exception:
+            return
+        if m == self._des_mtime:
+            return
+        lista = ler_desenhos()
+        if lista is None:
+            return                     # sendo gravado: olha de novo na próxima volta
+        self._des_mtime = m
+        ass = json.dumps(lista, sort_keys=True)
+        if ass != self._des_ass:
+            self._des_ass = ass
+            self.js("setDesenhos", lista)
+
     def _salvar_estado_avisos(self):
         novo = {"avisado": list(self.avisado) if self.avisado else None, "armado": self.armado, "armado_saida": self.armado_saida}
         if self.aj.get("estado_avisos") != novo:
@@ -681,6 +918,15 @@ class Cripto:
         if not self.armado:
             return
         if self.avisado == chave:
+            return
+        pl = plano(a, self.aj)
+        if not pl["melhor"]:
+            if self.ignorado != chave:         # registra uma vez por candle; se o risco/retorno melhorar, avisa ainda neste sinal
+                self.ignorado = chave
+                b = pl["bons"][0] if pl["bons"] else None
+                log.info("sinal ignorado (%s %.2f): sem alvo de %.0f por 1 — melhor lucro %s, stop %s", a["nivel"], a["preco"],
+                         pl["rr_min"], f"${b['liquido']:,.0f}" if b else "nenhum",
+                         f"−${abs(pl['stop']['perda']):,.0f}" if pl["stop"] else "sem suporte")
             return
         self.avisado, self.armado = chave, False
         self.disparar(a)
@@ -787,7 +1033,8 @@ class Cripto:
         if not a:
             return None, None
         pl = plano(a, self.aj)
-        alvo = pl["bons"][0]["preco"] if pl.get("bons") else None
+        b = pl.get("melhor") or (pl["bons"][0] if pl.get("bons") else None)
+        alvo = b["preco"] if b else None
         stop = pl["stop"]["preco"] if pl.get("stop") else None
         return alvo, stop
 
@@ -967,8 +1214,10 @@ class Cripto:
 
     def info_inicial(self):
         return {"valor": self.aj["valor_trade"], "taxa_pct": self.aj["taxa_pct"], "margem": self.aj["margem_alvo"],
+                "rr_minimo": float(self.aj.get("rr_minimo", 3)),
                 "linhas": self.aj.get("linhas", []), "topico": self.aj["ntfy_topico"], "servidor": self.aj["ntfy_servidor"], "historico": self.historico,
-                "celular": self.aj.get("celular", True), "monitor": self.aj.get("monitor_alerta", 2)}
+                "celular": self.aj.get("celular", True), "monitor": self.aj.get("monitor_alerta", 2),
+                "desenhos": (lambda d: d if isinstance(d, list) else [])(self.desenhos())}
 
     def set_celular(self, ligado):
         self.aj["celular"] = bool(ligado); salvar_ajustes(self.aj)
@@ -1017,7 +1266,25 @@ class ApiPagina:
         return self._app.apagar_operacao(fim, entrada)
 
     def recarregar(self):
-        self._app.enviado = {}; return True
+        self._app.enviado = {}; self._app._des_mtime = self._app._des_ass = None; return True
+
+    def mover_linha(self, id_, preco):
+        return self._app.mover_linha(id_, preco)
+
+    def grafico(self, tf):
+        return self._app.grafico_tf(tf)
+
+    def desenhos(self):
+        return self._app.desenhos()
+
+    def salvar_desenho(self, d):
+        return self._app.salvar_desenho(d)
+
+    def apagar_desenho(self, id_):
+        return self._app.apagar_desenho(id_)
+
+    def limpar_desenhos(self, autor=None):
+        return self._app.limpar_desenhos(autor)
 
 
 LIB = PASTA / "lightweight-charts.js"
@@ -1081,7 +1348,9 @@ def main():
     log.info("Modo Cripto iniciado (%s), avisos no monitor %s, celular: %s", app.aj["par"], app.aj["monitor_alerta"], app.aj["ntfy_topico"])
     def comandos():
         while True:
-            app.ler_comando(); time.sleep(1)
+            app.ler_comando()
+            app.checar_desenhos()          # um agente marcou algo no cripto.json: aparece na tela
+            time.sleep(1)
     threading.Thread(target=comandos, daemon=True).start()
     threading.Thread(target=app.sincronizar, daemon=True, name="sync").start()
     webview.start(lambda: threading.Thread(target=app.ciclo, daemon=True).start())
